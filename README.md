@@ -24,7 +24,8 @@ The usage is a one-line modification:
 
 ```python
 model = MyModel() # init a model
-import tune_mode_convbn; tune_mode_convbn.turn_on(model, mode='tune')
+import tune_mode_convbn
+tune_mode_convbn.turn_on_efficient_conv_bn_eval_for_single_model(model)
 # now this model can benefit from tune mode, if it is trained with `Eval` mode.
 ```
 
