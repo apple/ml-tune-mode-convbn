@@ -4,125 +4,151 @@
 #
 
 
-# Import required libraries
-from typing import Tuple
-from functools import partial
 from operator import attrgetter
+from typing import List, Union
 
 import torch
 import torch.nn as nn
-import torch.fx as fx
-from torch.nn.utils.fusion import fuse_conv_bn_weights
 
 
-# Function to compute parameters of the convolution layer on-the-fly
-def compute_params_on_the_fly(conv_weight, conv_bias, bn_weight, bn_bias, weight_coeff, bias_delta):
-    weight_on_the_fly = conv_weight 
-    bias_on_the_fly = conv_bias
-    coefff_on_the_fly = weight_coeff * bn_weight.view_as(weight_coeff) # shape of [C_out, 1, 1, 1]
-    weight_on_the_fly = weight_on_the_fly * coefff_on_the_fly # shape of [C_out, C_in, k, k] in Conv2d
-    bias_on_the_fly = (bias_on_the_fly + bias_delta) * coefff_on_the_fly.flatten() + bn_bias # shape of [C_out]
-    return weight_on_the_fly, bias_on_the_fly
+def efficient_conv_bn_eval_forward(bn: nn.modules.batchnorm._BatchNorm,
+                                   conv: nn.modules.conv._ConvNd,
+                                   x: torch.Tensor):
+    """Code borrowed from mmcv 2.0.1, so that this feature can be used for old
+    mmcv versions.
 
-# Function to get the on-the-fly parameters
-def get_params(self):
-    weight_on_the_fly, bias_on_the_fly = compute_params_on_the_fly(
-        self.weight, # shape of [C_out, C_in, k, k] in Conv2d
-        self.bias if self.bias is not None else torch.zeros_like(self.bn_bias), # shape of [C_out] in Conv2d
-        self.bn_weight,
-        self.bn_bias,
-        self.weight_coeff,
-        self.bias_delta
-    )
-    return weight_on_the_fly, bias_on_the_fly
-
-# Function to perform modified forward pass with on-the-fly parameters
-def modified_forward(self, input):
-    weight_on_the_fly, bias_on_the_fly = get_params(self)
-    return self.__class__._conv_forward(self, input, weight_on_the_fly, bias_on_the_fly)
-
-# Function to turn on the tune mode by fusing convolution and batch normalization layers
-def turn_on_tune_mode(conv, bn):
-    with torch.no_grad():
-        weight_coeff = torch.rsqrt(bn.running_var + bn.eps) # shape of [C_out] in Conv2d
-        weight_coeff = torch.tensor(weight_coeff.reshape([-1] + [1] * (len(conv.weight.shape) - 1))) # shape of [C_out, 1, 1, 1] in Conv2d
-        conv.register_buffer('weight_coeff', weight_coeff)
-        conv.register_buffer('bias_delta', - bn.running_mean) # shape of [C_out] in Conv2d
-        conv.bn_weight = bn.weight
-        conv.bn_bias = bn.bias
-        del bn.weight
-        del bn.bias
-    conv.forward = partial(modified_forward, conv)
-
-# Function to turn on the deploy mode by fusing convolution and batch normalization layers
-def turn_on_deploy_mode(conv, bn):
-    with torch.no_grad():
-        new_weight, new_bias = fuse_conv_bn_weights(conv.weight, conv.bias, bn.running_mean, bn.running_var, bn.eps, bn.weight, bn.bias)
-        conv.weight = new_weight
-        conv.bias = new_bias
-
-        del bn.weight
-        del bn.bias
-
-
-# Helper function to split a qualname into parent path and last atom.
-def _parent_name(target : str) -> Tuple[str, str]:
+    Implementation based on https://arxiv.org/abs/2305.11624
+    "Tune-Mode ConvBN Blocks For Efficient Transfer Learning"
+    It leverages the associative law between convolution and affine transform,
+    i.e., normalize (weight conv feature) = (normalize weight) conv feature.
+    It works for Eval mode of ConvBN blocks during validation, and can be used
+    for training as well. It reduces memory and computation cost.
+    Args:
+        bn (_BatchNorm): a BatchNorm module.
+        conv (nn._ConvNd): a conv module
+        x (torch.Tensor): Input feature map.
     """
-    Splits a qualname into parent path and last atom.
-    For example, `foo.bar.baz` -> (`foo.bar`, `baz`)
+    # These lines of code are designed to deal with various cases
+    # like bn without affine transform, and conv without bias
+    weight_on_the_fly = conv.weight
+    if conv.bias is not None:
+        bias_on_the_fly = conv.bias
+    else:
+        bias_on_the_fly = torch.zeros_like(bn.running_var)
+
+    if bn.weight is not None:
+        bn_weight = bn.weight
+    else:
+        bn_weight = torch.ones_like(bn.running_var)
+
+    if bn.bias is not None:
+        bn_bias = bn.bias
+    else:
+        bn_bias = torch.zeros_like(bn.running_var)
+
+    # shape of [C_out, 1, 1, 1] in Conv2d
+    weight_coeff = torch.rsqrt(bn.running_var +
+                               bn.eps).reshape([-1] + [1] *
+                                               (len(conv.weight.shape) - 1))
+    # shape of [C_out, 1, 1, 1] in Conv2d
+    coefff_on_the_fly = bn_weight.view_as(weight_coeff) * weight_coeff
+
+    # shape of [C_out, C_in, k, k] in Conv2d
+    weight_on_the_fly = weight_on_the_fly * coefff_on_the_fly
+    # shape of [C_out] in Conv2d
+    bias_on_the_fly = bn_bias + coefff_on_the_fly.flatten() *\
+        (bias_on_the_fly - bn.running_mean)
+
+    return conv._conv_forward(x, weight_on_the_fly, bias_on_the_fly)
+
+
+def efficient_conv_bn_eval_control(bn: nn.modules.batchnorm._BatchNorm,
+                                   conv: nn.modules.conv._ConvNd,
+                                   x: torch.Tensor):
+    """This function controls whether to use `efficient_conv_bn_eval_forward`.
+
+    If the following `bn` is in `eval` mode, then we turn on the special
+    `efficient_conv_bn_eval_forward`.
     """
-    *parent, name = target.rsplit('.', 1)
-    return parent[0] if parent else '', name
+    if not bn.training:
+        # bn in eval mode
+        output = efficient_conv_bn_eval_forward(bn, conv, x)
+        return output
+    else:
+        conv_out = conv._conv_forward(x, conv.weight, conv.bias)
+        return bn(conv_out)
 
 
-# Main function to turn on the optimization mode (tune or deploy) for the given model
-def turn_on(model: torch.nn.Module, mode = 'Tune') -> torch.nn.Module:
-    """
-    model: the Module to optimize (bn modules are reserved in a module list in model.reseverd_bns)
-    mode: tune or deploy
-    """    
-
-    mode = mode.lower()
-    assert mode in ['tune', 'deploy']
-
-    # Symbolically trace the input model to create an FX GraphModule
-    fx_model: fx.GraphModule = fx.symbolic_trace(model)
+def efficient_conv_bn_eval_graph_transform(fx_model):
+    """Find consecutive conv+bn calls in the graph, inplace modify the graph
+    with the fused operation."""
     modules = dict(fx_model.named_modules())
-    model.reserved_bns = nn.ModuleList()
 
-    patterns = [(torch.nn.Conv1d, torch.nn.BatchNorm1d),
-                (torch.nn.Conv2d, torch.nn.BatchNorm2d),
-                (torch.nn.Conv3d, torch.nn.BatchNorm3d)]
+    patterns = [(torch.nn.modules.conv._ConvNd,
+                 torch.nn.modules.batchnorm._BatchNorm)]
 
+    pairs = []
     # Iterate through nodes in the graph to find ConvBN blocks
     for node in fx_model.graph.nodes:
-        if node.op != 'call_module': # If our current node isn't calling a Module then we can ignore it.
+        # If our current node isn't calling a Module then we can ignore it.
+        if node.op != 'call_module':
             continue
-        found_pair = [node for conv_class, bn_class in patterns if type(modules[node.target]) is bn_class and type(modules[node.args[0].target]) is conv_class]
-        if not found_pair or len(node.args[0].users) > 1: # Not a conv-BN pattern or output of conv is used by other nodes
+        target_module = modules[node.target]
+        found_pair = False
+        for conv_class, bn_class in patterns:
+            if isinstance(target_module, bn_class):
+                source_module = modules[node.args[0].target]
+                if isinstance(source_module, conv_class):
+                    found_pair = True
+        # Not a conv-BN pattern or output of conv is used by other nodes
+        if not found_pair or len(node.args[0].users) > 1:
             continue
 
-        # Find a pair of conv and bn to optimize
-        conv_name = node.args[0].target
-        bn_name = node.target
+        # Find a pair of conv and bn computation nodes to optimize
+        conv_node = node.args[0]
+        bn_node = node
+        pairs.append([conv_node, bn_node])
 
-        print(f'Turn on mode {mode} for {conv_name} and {bn_name}')
-        conv = modules[conv_name]
-        bn = modules[bn_name]
-        
-        # Turn on the optimization mode and move the bn to reserved_bns
-        if mode == 'tune':
-            turn_on_tune_mode(conv, bn)
-        else:
-            turn_on_deploy_mode(conv, bn)
+    for conv_node, bn_node in pairs:
+        # set insertion point
+        fx_model.graph.inserting_before(conv_node)
+        # create `get_attr` node to access modules
+        # note that we directly call `create_node` to fill the `name`
+        # argument. `fx_model.graph.get_attr` and
+        # `fx_model.graph.call_function` does not allow the `name` argument.
+        conv_get_node = fx_model.graph.create_node(
+            op='get_attr', target=conv_node.target, name='get_conv')
+        bn_get_node = fx_model.graph.create_node(
+            op='get_attr', target=bn_node.target, name='get_bn')
+        # prepare args for the fused function
+        args = (bn_get_node, conv_get_node, conv_node.args[0])
+        # create a new node
+        new_node = fx_model.graph.create_node(
+            op='call_function',
+            target=efficient_conv_bn_eval_control,
+            args=args,
+            name='efficient_conv_bn_eval')
+        # this node replaces the original conv + bn, and therefore
+        # should replace the uses of bn_node
+        bn_node.replace_all_uses_with(new_node)
+        # take care of the deletion order:
+        # delete bn_node first, and then conv_node
+        fx_model.graph.erase_node(bn_node)
+        fx_model.graph.erase_node(conv_node)
 
-        model.reserved_bns.append(bn)
+    # regenerate the code
+    fx_model.graph.lint()
+    fx_model.recompile()
 
-        # Remove the original bn from the model
-        parent_name, name = _parent_name(bn_name)
-        if parent_name != '':
-            getter = attrgetter(parent_name)
-            bn_parent = getter(model)
-        else:
-            bn_parent = model
-        setattr(bn_parent, name, nn.Identity())
+
+def turn_on_efficient_conv_bn_eval_for_single_model(model: torch.nn.Module):
+    import torch.fx as fx
+
+    # currently we use `fx.symbolic_trace` to trace models.
+    # in the future, we might turn to pytorch 2.0 compile infrastructure to
+    # get the `fx.GraphModule` IR. Nonetheless, the graph transform function
+    # can remain unchanged. We just need to change the way
+    # we get `fx.GraphModule`.
+    fx_model: fx.GraphModule = fx.symbolic_trace(model)
+    efficient_conv_bn_eval_graph_transform(fx_model)
+    model.forward = fx_model.forward
